@@ -674,9 +674,11 @@ public final class SplatRenderer: @unchecked Sendable {
                        for commandBuffer: MTLCommandBuffer) -> MTLRenderCommandEncoder {
         let renderPassDescriptor = MTLRenderPassDescriptor()
         renderPassDescriptor.colorAttachments[0].texture = colorTexture
-        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].loadAction = colorLoadAction
         renderPassDescriptor.colorAttachments[0].storeAction = colorStoreAction
-        renderPassDescriptor.colorAttachments[0].clearColor = clearColor
+        if colorLoadAction == .clear {
+            renderPassDescriptor.colorAttachments[0].clearColor = clearColor
+        }
         if let depthTexture {
             renderPassDescriptor.depthAttachment.texture = depthTexture
             renderPassDescriptor.depthAttachment.loadAction = .clear
@@ -732,6 +734,7 @@ public final class SplatRenderer: @unchecked Sendable {
     @discardableResult
     public func render(viewports: [ViewportDescriptor],
                        colorTexture: MTLTexture,
+                       colorLoadAction: MTLLoadAction = .clear,
                        colorStoreAction: MTLStoreAction,
                        depthTexture: MTLTexture?,
                        rasterizationRateMap: MTLRasterizationRateMap?,
