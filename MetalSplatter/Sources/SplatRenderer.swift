@@ -156,6 +156,10 @@ public final class SplatRenderer: @unchecked Sendable {
         set { sorter.onSortComplete = newValue }
     }
 
+    /// When true, skips updating the camera pose for sorting. This prevents the visual "pop"
+    /// that occurs when sort order updates after interactive rotation gestures end.
+    public var pauseSorting: Bool = false
+
     private let library: MTLLibrary
 
     // MARK: - Chunk Storage
@@ -783,9 +787,11 @@ public final class SplatRenderer: @unchecked Sendable {
 
         guard !enabledChunks.isEmpty else { return false }
 
-        // Compute camera pose for sorting
-        let cameraPose = Self.cameraWorldPose(forViewports: viewports)
-        sorter.updateCameraPose(position: cameraPose.position, forward: cameraPose.forward)
+        // Compute camera pose for sorting (skip if sorting is paused during gestures)
+        if !pauseSorting {
+            let cameraPose = Self.cameraWorldPose(forViewports: viewports)
+            sorter.updateCameraPose(position: cameraPose.position, forward: cameraPose.forward)
+        }
 
         // Try to get sorted indices, optionally waiting up to sortTimeout
         var splatIndexBuffer = sorter.tryObtainSortedIndices()
