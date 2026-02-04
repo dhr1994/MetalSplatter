@@ -6,6 +6,16 @@ import SplatIO
 import Synchronization
 
 public final class SplatRenderer: @unchecked Sendable {
+    /// Selects which sorting implementation to use
+    public enum SorterMode: Sendable {
+        /// Use CPU-based sorting (original implementation)
+        case cpu
+        /// Use GPU-based radix sort (faster, reduces flicker during rotation)
+        case gpu
+        /// Automatically select based on device capabilities (prefers GPU)
+        case auto
+    }
+
     enum Constants {
         // Keep in sync with Shaders.metal : maxViewCount
         static let maxViewCount = 2
@@ -148,17 +158,29 @@ public final class SplatRenderer: @unchecked Sendable {
     /// Called when a sort starts
     public var onSortStart: (@Sendable () -> Void)? {
         get { sorter.onSortStart }
-        set { sorter.onSortStart = newValue }
+        set {
+            sorter.onSortStart = newValue
+            gpuSorter?.onSortStart = newValue
+        }
     }
     /// Called when a sort completes. The TimeInterval is the duration of the sort.
     public var onSortComplete: (@Sendable (TimeInterval) -> Void)? {
         get { sorter.onSortComplete }
-        set { sorter.onSortComplete = newValue }
+        set {
+            sorter.onSortComplete = newValue
+            gpuSorter?.onSortComplete = newValue
+        }
     }
 
     /// When true, skips updating the camera pose for sorting. This prevents the visual "pop"
     /// that occurs when sort order updates after interactive rotation gestures end.
     public var pauseSorting: Bool = false
+
+    /// Controls which sorting implementation is used.
+    /// - `.cpu`: Uses the original CPU-based sort
+    /// - `.gpu`: Uses GPU-accelerated radix sort (faster, reduces flicker)
+    /// - `.auto`: Automatically selects GPU if available, falls back to CPU
+    public private(set) var sorterMode: SorterMode = .auto
 
     private let library: MTLLibrary
 
@@ -179,6 +201,7 @@ public final class SplatRenderer: @unchecked Sendable {
     private var chunkIDToIndex: [ChunkID: UInt16] = [:]
 
     private let sorter: SplatSorter
+    private var gpuSorter: SplatSorterGPU?
 
     /// Uniform buffer storage - contains maxSimultaneousRenders uniform buffers that we round-robin through.
     private let dynamicUniformBuffers: MTLBuffer
@@ -250,7 +273,8 @@ public final class SplatRenderer: @unchecked Sendable {
                 maxViewCount: Int,
                 maxSimultaneousRenders: Int,
                 highQualityDepth: Bool = true,
-                clearColor: MTLClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)) throws {
+                clearColor: MTLClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0),
+                sorterMode: SorterMode = .auto) throws {
 #if arch(x86_64)
         fatalError("MetalSplatter is unsupported on Intel architecture (x86_64)")
 #endif
@@ -284,6 +308,35 @@ public final class SplatRenderer: @unchecked Sendable {
             library = try device.makeDefaultLibrary(bundle: Bundle.module)
         } catch {
             fatalError("Unable to initialize SplatRenderer: \(error)")
+        }
+
+        // Initialize GPU sorter based on mode
+        Self.log.info("Initializing sorter with mode: \(String(describing: sorterMode))")
+        switch sorterMode {
+        case .cpu:
+            self.sorterMode = .cpu
+            self.gpuSorter = nil
+            Self.log.info("Using CPU sorter (explicitly requested)")
+        case .gpu:
+            do {
+                self.gpuSorter = try SplatSorterGPU(device: device)
+                self.sorterMode = .gpu
+                Self.log.info("GPU sorter initialized successfully (explicitly requested)")
+            } catch {
+                Self.log.error("Failed to initialize GPU sorter: \(error). Falling back to CPU.")
+                self.gpuSorter = nil
+                self.sorterMode = .cpu
+            }
+        case .auto:
+            do {
+                self.gpuSorter = try SplatSorterGPU(device: device)
+                self.sorterMode = .gpu
+                Self.log.info("GPU sorter initialized successfully (auto mode)")
+            } catch {
+                Self.log.warning("GPU sorter unavailable: \(error). Using CPU sorter.")
+                self.gpuSorter = nil
+                self.sorterMode = .cpu
+            }
         }
     }
 
@@ -331,6 +384,7 @@ public final class SplatRenderer: @unchecked Sendable {
         await withChunkAccess {
             chunks.removeAll()
             sorter.setChunks([])
+            gpuSorter?.setChunks([])
         }
     }
 
@@ -414,6 +468,14 @@ public final class SplatRenderer: @unchecked Sendable {
 
         chunkIDToIndex = newChunkIDToIndex
         sorter.setChunks(chunkReferences)
+
+        // Also update GPU sorter if available
+        if let gpuSorter {
+            let gpuChunkRefs = chunkReferences.map { ref in
+                SplatSorterGPU.ChunkReference(chunkIndex: ref.chunkIndex, buffer: ref.buffer)
+            }
+            gpuSorter.setChunks(gpuChunkRefs)
+        }
     }
 
     /// Called when a render's command buffer completes on the GPU.
@@ -818,19 +880,51 @@ public final class SplatRenderer: @unchecked Sendable {
         if !pauseSorting {
             let cameraPose = Self.cameraWorldPose(forViewports: viewports)
             sorter.updateCameraPose(position: cameraPose.position, forward: cameraPose.forward)
+            gpuSorter?.updateCameraPose(position: cameraPose.position, forward: cameraPose.forward)
         }
 
-        // Try to get sorted indices, optionally waiting up to sortTimeout
-        var splatIndexBuffer = sorter.tryObtainSortedIndices()
+        // Try to get sorted indices from GPU sorter first, fall back to CPU
+        var splatIndexBuffer: MetalBuffer<ChunkedSplatIndex>?
+        var usingGPUSorter = false
+
+        if let gpuSorter, sorterMode == .gpu {
+            splatIndexBuffer = gpuSorter.tryObtainSortedIndices()
+            if splatIndexBuffer != nil {
+                usingGPUSorter = true
+            }
+        }
+
+        // Fall back to CPU sorter if GPU sorter didn't provide indices
+        if splatIndexBuffer == nil {
+            splatIndexBuffer = sorter.tryObtainSortedIndices()
+        }
+
+        // If still no buffer, wait for one (prefer GPU if available)
         if splatIndexBuffer == nil && sortTimeout > 0 {
             let deadline = Date().addingTimeInterval(sortTimeout)
             while splatIndexBuffer == nil && Date() < deadline {
                 Thread.sleep(forTimeInterval: 0.01)
-                splatIndexBuffer = sorter.tryObtainSortedIndices()
+
+                if let gpuSorter, sorterMode == .gpu {
+                    splatIndexBuffer = gpuSorter.tryObtainSortedIndices()
+                    if splatIndexBuffer != nil {
+                        usingGPUSorter = true
+                    }
+                }
+
+                if splatIndexBuffer == nil {
+                    splatIndexBuffer = sorter.tryObtainSortedIndices()
+                }
             }
         }
         guard let splatIndexBuffer else { return false }
-        defer { sorter.releaseSortedIndices(splatIndexBuffer) }
+        defer {
+            if usingGPUSorter {
+                gpuSorter?.releaseSortedIndices(splatIndexBuffer)
+            } else {
+                sorter.releaseSortedIndices(splatIndexBuffer)
+            }
+        }
 
         let splatCount = splatIndexBuffer.count
         guard splatCount != 0 else { return false }

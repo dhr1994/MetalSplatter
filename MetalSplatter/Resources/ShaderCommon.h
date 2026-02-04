@@ -113,3 +113,34 @@ typedef struct
     half2 relativePosition; // Ranges from -kBoundsRadius to +kBoundsRadius
     half4 color;
 } FragmentIn;
+
+// ============================================================================
+// GPU Radix Sort Structures
+// ============================================================================
+
+// Depth key paired with original splat index for sorting
+typedef struct
+{
+    uint sortKey;       // Depth encoded as sortable uint (IEEE 754 trick)
+    uint globalIndex;   // Original index across all chunks
+} SplatDepthKey;
+
+// Uniforms passed to GPU sort compute kernels
+typedef struct
+{
+    packed_float3 cameraPosition;
+    uint totalSplatCount;
+    uint bitOffset;     // Current bit position: 0, 8, 16, or 24 for 4 radix passes
+    uint blockCount;    // Number of threadgroups for histogram/scatter
+    uint sortByDistance; // 1 = distance from camera, 0 = dot product with forward
+    packed_float3 cameraForward;
+    uint _padding;
+} GPUSortUniforms;
+
+// Maps global splat index to chunk/local index for final output
+typedef struct
+{
+    uint startIndex;    // Cumulative splat count before this chunk
+    uint16_t chunkIndex;
+    uint16_t _padding;
+} ChunkOffsetEntry;
