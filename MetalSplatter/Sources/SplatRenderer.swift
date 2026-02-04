@@ -491,8 +491,9 @@ public final class SplatRenderer: @unchecked Sendable {
 
         let depthStateDescriptor = MTLDepthStencilDescriptor()
         // Use .less to enable occlusion by external depth buffers (e.g., AR planes)
+        // Disable depth write so splats don't occlude each other (they use alpha blending)
         depthStateDescriptor.depthCompareFunction = MTLCompareFunction.less
-        depthStateDescriptor.isDepthWriteEnabled = writeDepth
+        depthStateDescriptor.isDepthWriteEnabled = false
         return device.makeDepthStencilState(descriptor: depthStateDescriptor)!
     }
 
@@ -533,8 +534,10 @@ public final class SplatRenderer: @unchecked Sendable {
 
         let depthStateDescriptor = MTLDepthStencilDescriptor()
         // Use .less to enable occlusion by external depth buffers (e.g., AR planes)
+        // Disable depth write so splats don't occlude each other (they use alpha blending)
+        // Final depth is written by the postprocess pass from tile memory
         depthStateDescriptor.depthCompareFunction = MTLCompareFunction.less
-        depthStateDescriptor.isDepthWriteEnabled = writeDepth
+        depthStateDescriptor.isDepthWriteEnabled = false
         return device.makeDepthStencilState(descriptor: depthStateDescriptor)!
     }
 
