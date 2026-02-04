@@ -490,7 +490,8 @@ public final class SplatRenderer: @unchecked Sendable {
         assert(!useMultiStagePipeline)
 
         let depthStateDescriptor = MTLDepthStencilDescriptor()
-        depthStateDescriptor.depthCompareFunction = MTLCompareFunction.always
+        // Use .less to enable occlusion by external depth buffers (e.g., AR planes)
+        depthStateDescriptor.depthCompareFunction = MTLCompareFunction.less
         depthStateDescriptor.isDepthWriteEnabled = writeDepth
         return device.makeDepthStencilState(descriptor: depthStateDescriptor)!
     }
@@ -531,7 +532,8 @@ public final class SplatRenderer: @unchecked Sendable {
         assert(useMultiStagePipeline)
 
         let depthStateDescriptor = MTLDepthStencilDescriptor()
-        depthStateDescriptor.depthCompareFunction = MTLCompareFunction.always
+        // Use .less to enable occlusion by external depth buffers (e.g., AR planes)
+        depthStateDescriptor.depthCompareFunction = MTLCompareFunction.less
         depthStateDescriptor.isDepthWriteEnabled = writeDepth
         return device.makeDepthStencilState(descriptor: depthStateDescriptor)!
     }
@@ -683,6 +685,7 @@ public final class SplatRenderer: @unchecked Sendable {
                        colorLoadAction: MTLLoadAction,
                        colorStoreAction: MTLStoreAction,
                        depthTexture: MTLTexture?,
+                       depthLoadAction: MTLLoadAction,
                        rasterizationRateMap: MTLRasterizationRateMap?,
                        renderTargetArrayLength: Int,
                        for commandBuffer: MTLCommandBuffer) -> MTLRenderCommandEncoder {
@@ -695,9 +698,12 @@ public final class SplatRenderer: @unchecked Sendable {
         }
         if let depthTexture {
             renderPassDescriptor.depthAttachment.texture = depthTexture
-            renderPassDescriptor.depthAttachment.loadAction = .clear
+            renderPassDescriptor.depthAttachment.loadAction = depthLoadAction
             renderPassDescriptor.depthAttachment.storeAction = .store
-            renderPassDescriptor.depthAttachment.clearDepth = 0.0
+            if depthLoadAction == .clear {
+                // Use 1.0 (far plane) for standard depth testing with .less compare function
+                renderPassDescriptor.depthAttachment.clearDepth = 1.0
+            }
         }
         renderPassDescriptor.rasterizationRateMap = rasterizationRateMap
         renderPassDescriptor.renderTargetArrayLength = renderTargetArrayLength
@@ -751,6 +757,7 @@ public final class SplatRenderer: @unchecked Sendable {
                        colorLoadAction: MTLLoadAction = .clear,
                        colorStoreAction: MTLStoreAction,
                        depthTexture: MTLTexture?,
+                       depthLoadAction: MTLLoadAction = .clear,
                        rasterizationRateMap: MTLRasterizationRateMap?,
                        renderTargetArrayLength: Int,
                        accessTimeout: TimeInterval = 0.1,
@@ -854,6 +861,7 @@ public final class SplatRenderer: @unchecked Sendable {
                                           colorLoadAction: colorLoadAction,
                                           colorStoreAction: colorStoreAction,
                                           depthTexture: depthTexture,
+                                          depthLoadAction: depthLoadAction,
                                           rasterizationRateMap: rasterizationRateMap,
                                           renderTargetArrayLength: renderTargetArrayLength,
                                           for: commandBuffer)
