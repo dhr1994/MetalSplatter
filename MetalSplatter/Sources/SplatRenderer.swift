@@ -549,7 +549,20 @@ public final class SplatRenderer: @unchecked Sendable {
             ? library.makeRequiredFunction(name: "postprocessFragmentShader")
             : library.makeRequiredFunction(name: "postprocessFragmentShaderNoDepth")
 
-        pipelineDescriptor.colorAttachments[0]!.pixelFormat = colorFormat
+        // Configure color attachment with alpha blending for proper compositing
+        // This allows splats to blend over existing content (e.g., AR camera background)
+        // when colorLoadAction is .load
+        let colorAttachment = pipelineDescriptor.colorAttachments[0]!
+        colorAttachment.pixelFormat = colorFormat
+        colorAttachment.isBlendingEnabled = true
+        // Premultiplied alpha blending: output = src + dst * (1 - srcAlpha)
+        colorAttachment.sourceRGBBlendFactor = .one
+        colorAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        colorAttachment.rgbBlendOperation = .add
+        colorAttachment.sourceAlphaBlendFactor = .one
+        colorAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        colorAttachment.alphaBlendOperation = .add
+
         pipelineDescriptor.depthAttachmentPixelFormat = depthFormat
 
         pipelineDescriptor.maxVertexAmplificationCount = maxViewCount
