@@ -649,7 +649,8 @@ class SplatSorterGPU: @unchecked Sendable {
 
         if !wasInvalidated {
             let duration = -startTime.timeIntervalSinceNow
-            Self.log.info("GPU bitonic sort completed: \(totalSplatCount) splats (padded to \(paddedCount)) in \(String(format: "%.1f", duration * 1000))ms")
+            // Removed verbose per-frame logging - was flooding logs at 60fps × 2 models = 120 lines/sec
+            // Self.log.info("GPU bitonic sort completed: \(totalSplatCount) splats (padded to \(paddedCount)) in \(String(format: "%.1f", duration * 1000))ms")
             onSortComplete?(duration)
         }
     }
