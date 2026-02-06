@@ -687,10 +687,16 @@ class SplatSorterGPU: @unchecked Sendable {
         let chunksArraySize = chunks.count * chunkInfoSize
         let requiredSize = headerSize + chunksArraySize
 
-        guard let buffer = device.makeBuffer(length: requiredSize, options: .storageModeShared) else {
-            return nil
+        // Pool the buffer - only allocate if we don't have one or it's too small
+        if chunkTableBuffer == nil || chunkTableBuffer!.length < requiredSize {
+            guard let buffer = device.makeBuffer(length: requiredSize, options: .storageModeShared) else {
+                return nil
+            }
+            buffer.label = "GPU Sort Chunk Table"
+            chunkTableBuffer = buffer
         }
-        buffer.label = "GPU Sort Chunk Table"
+
+        guard let buffer = chunkTableBuffer else { return nil }
 
         let ptr = buffer.contents()
 
