@@ -578,7 +578,7 @@ class SplatSorterGPU: @unchecked Sendable {
                 encoder.endEncoding()
             }
 
-            // Prefix Sum - one threadgroup per digit
+            // Prefix Sum - single threadgroup of 256 threads
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
                 encoder.label = "Prefix Sum Pass \(pass)"
                 encoder.setComputePipelineState(prefixSumLocalPipeline)
@@ -586,25 +586,14 @@ class SplatSorterGPU: @unchecked Sendable {
                 encoder.setBuffer(blockSumsBuffer, offset: 0, index: 1)
                 encoder.setBytes(&uniforms, length: MemoryLayout<GPUSortUniforms>.size, index: 2)
 
+                // Single threadgroup with 256 threads for 256-element prefix sum
                 let threadsPerThreadgroup = MTLSize(width: Int(Self.radixSize), height: 1, depth: 1)
-                encoder.dispatchThreadgroups(MTLSize(width: Int(Self.radixSize), height: 1, depth: 1),
+                encoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                              threadsPerThreadgroup: threadsPerThreadgroup)
                 encoder.endEncoding()
             }
 
-            // Add block sums
-            if let encoder = commandBuffer.makeComputeCommandEncoder() {
-                encoder.label = "Add Block Sums Pass \(pass)"
-                encoder.setComputePipelineState(addBlockSumsPipeline)
-                encoder.setBuffer(histogramBuffer, offset: 0, index: 0)
-                encoder.setBuffer(blockSumsBuffer, offset: 0, index: 1)
-                encoder.setBytes(&uniforms, length: MemoryLayout<GPUSortUniforms>.size, index: 2)
-
-                let threadsPerGrid = MTLSize(width: max(blockCount, Int(Self.radixSize)), height: 1, depth: 1)
-                let threadsPerThreadgroup = MTLSize(width: Int(Self.radixSize), height: 1, depth: 1)
-                encoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
-                encoder.endEncoding()
-            }
+            // Note: addBlockSums pass removed - not needed in simplified approach
 
             // Scatter
             if let encoder = commandBuffer.makeComputeCommandEncoder() {
@@ -687,14 +676,14 @@ class SplatSorterGPU: @unchecked Sendable {
             depthKeysB!.buffer.label = "Depth Keys B"
         }
 
-        // Histogram buffer: 256 digits × blockCount
-        let histogramSize = Int(Self.radixSize) * blockCount * MemoryLayout<UInt32>.stride
+        // Histogram buffer: just 256 elements (simplified approach)
+        let histogramSize = Int(Self.radixSize) * MemoryLayout<UInt32>.stride
         if histogramBuffer == nil || histogramBuffer!.length < histogramSize {
             histogramBuffer = device.makeBuffer(length: histogramSize, options: .storageModeShared)
             histogramBuffer?.label = "Histogram"
         }
 
-        // Block sums buffer: 256 digits
+        // Block sums buffer: 256 digits (kept for API compatibility, not used)
         let blockSumsSize = Int(Self.radixSize) * MemoryLayout<UInt32>.stride
         if blockSumsBuffer == nil || blockSumsBuffer!.length < blockSumsSize {
             blockSumsBuffer = device.makeBuffer(length: blockSumsSize, options: .storageModeShared)
