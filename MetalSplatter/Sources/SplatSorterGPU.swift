@@ -4,36 +4,40 @@ import Synchronization
 import os
 
 /**
- SplatSorterGPU provides GPU-accelerated radix sort for splat depth ordering.
+ SplatSorterGPU provides GPU-accelerated bitonic sort for splat depth ordering.
 
  This is a drop-in replacement for SplatSorter that uses Metal compute shaders
  to perform the depth sort on the GPU. For 200K splats, this reduces sort time
- from ~100-200ms (CPU) to ~5-10ms (GPU), eliminating the visual "pop" during rotation.
+ from ~100-200ms (CPU) to ~2-5ms (GPU), eliminating the visual "pop" during rotation.
 
  ## Algorithm
 
- The implementation uses a 4-pass radix sort on 32-bit depth keys (8 bits per pass):
+ The implementation uses a bitonic sort on 32-bit depth keys:
  1. Compute depth keys: Transform splat positions to sortable uint depths
- 2. For each of 4 passes (bits 0-7, 8-15, 16-23, 24-31):
-    a. Histogram: Count digit occurrences per threadgroup
-    b. Prefix Sum: Compute exclusive scan for output offsets
-    c. Scatter: Reorder elements to their sorted positions
- 3. Convert: Transform sorted global indices back to ChunkedSplatIndex
+ 2. Pad to next power of 2 with UINT_MAX sentinel values
+ 3. bitonicSortLocal: Sort 512-element blocks in shared memory (stages 0-8)
+ 4. For stages 9..log2(N)-1:
+    a. bitonicMergeGlobal: Compare-and-swap for large strides (≥512)
+    b. bitonicMergeLocal: Finish stage in shared memory (strides <512)
+ 5. Convert: Transform sorted global indices back to ChunkedSplatIndex
+
+ Bitonic sort is deterministic (no atomics) and naturally suited to GPU parallelism.
+ It sorts in-place, needing only a single depth key buffer.
 
  ## Buffer Management
 
  Like SplatSorter, this class maintains triple-buffered output for lock-free rendering.
- Unlike the CPU version, sorting happens synchronously on the GPU and completes quickly
- enough that we don't need the complex async polling mechanism.
+ Sorting happens synchronously on the GPU and completes quickly enough that we don't
+ need the complex async polling mechanism.
  */
 class SplatSorterGPU: @unchecked Sendable {
 
     // MARK: - Constants
 
     private static let bufferCount = 3
-    private static let radixBits: UInt32 = 8
-    private static let radixSize: UInt32 = 256
     private static let threadgroupSize: Int = 256
+    private static let blockSize: Int = 512       // Elements per shared-memory block
+    private static let log2Block: Int = 9          // log2(512)
     private static let pollIntervalNanoseconds: UInt64 = 1_000_000 // 1ms
 
     // MARK: - Types
@@ -54,11 +58,11 @@ class SplatSorterGPU: @unchecked Sendable {
     private struct GPUSortUniforms {
         var cameraPosition: MTLPackedFloat3
         var totalSplatCount: UInt32
-        var bitOffset: UInt32
-        var blockCount: UInt32
+        var bitonicStage: UInt32
+        var bitonicStep: UInt32
         var sortByDistance: UInt32
         var cameraForward: MTLPackedFloat3
-        var _padding: UInt32 = 0
+        var paddedCount: UInt32
     }
 
     // Keep in sync with ShaderCommon.h : ChunkOffsetEntry
@@ -128,22 +132,15 @@ class SplatSorterGPU: @unchecked Sendable {
     // MARK: - Compute Pipeline States
 
     private let computeDepthsPipeline: MTLComputePipelineState
-    private let radixHistogramPipeline: MTLComputePipelineState
-    private let prefixSumLocalPipeline: MTLComputePipelineState
-    private let addBlockSumsPipeline: MTLComputePipelineState
-    private let radixScatterPipeline: MTLComputePipelineState
+    private let bitonicSortLocalPipeline: MTLComputePipelineState
+    private let bitonicMergeGlobalPipeline: MTLComputePipelineState
+    private let bitonicMergeLocalPipeline: MTLComputePipelineState
     private let convertToChunkedIndicesPipeline: MTLComputePipelineState
 
     // MARK: - Reusable Buffers
 
-    // Double-buffered depth keys for ping-pong during radix passes
-    private var depthKeysA: MetalBuffer<SplatDepthKey>?
-    private var depthKeysB: MetalBuffer<SplatDepthKey>?
-
-    // Histogram and prefix sum buffers
-    // Layout: histogram[digit * blockCount + blockIndex]
-    private var histogramBuffer: MTLBuffer?
-    private var blockSumsBuffer: MTLBuffer?
+    // Single depth key buffer (bitonic sort is in-place)
+    private var depthKeys: MetalBuffer<SplatDepthKey>?
 
     // Chunk offset table for final conversion
     private var chunkOffsetsBuffer: MetalBuffer<ChunkOffsetEntry>?
@@ -152,8 +149,7 @@ class SplatSorterGPU: @unchecked Sendable {
     private var chunkTableBuffer: MTLBuffer?
 
     // Track last known configuration to detect when buffers need resizing
-    private var lastSplatCount: Int = 0
-    private var lastBlockCount: Int = 0
+    private var lastPaddedCount: Int = 0
 
     // MARK: - Initialization
 
@@ -188,12 +184,11 @@ class SplatSorterGPU: @unchecked Sendable {
         }
 
         self.computeDepthsPipeline = try makePipeline("computeDepths")
-        self.radixHistogramPipeline = try makePipeline("radixHistogram")
-        self.prefixSumLocalPipeline = try makePipeline("prefixSumLocal")
-        self.addBlockSumsPipeline = try makePipeline("addBlockSums")
-        self.radixScatterPipeline = try makePipeline("radixScatter")
+        self.bitonicSortLocalPipeline = try makePipeline("bitonicSortLocal")
+        self.bitonicMergeGlobalPipeline = try makePipeline("bitonicMergeGlobal")
+        self.bitonicMergeLocalPipeline = try makePipeline("bitonicMergeLocal")
         self.convertToChunkedIndicesPipeline = try makePipeline("convertToChunkedIndices")
-        Self.log.info("All 6 compute pipelines created")
+        Self.log.info("All 5 compute pipelines created (bitonic sort)")
 
         // Initialize index buffers
         var indexBuffers: [IndexBuffer] = []
@@ -458,6 +453,9 @@ class SplatSorterGPU: @unchecked Sendable {
             return
         }
 
+        let paddedCount = nextPowerOfTwo(totalSplatCount)
+        let log2N = Int(log2(Double(paddedCount)))
+
         // Ensure output buffer has capacity
         do {
             try targetBuffer.ensureCapacity(totalSplatCount)
@@ -472,7 +470,7 @@ class SplatSorterGPU: @unchecked Sendable {
 
         // Ensure working buffers are sized correctly
         do {
-            try ensureBufferCapacity(splatCount: totalSplatCount)
+            try ensureBufferCapacity(paddedCount: paddedCount)
         } catch {
             Self.log.error("Failed to resize working buffers: \(error)")
             state.withLock { state in
@@ -501,24 +499,9 @@ class SplatSorterGPU: @unchecked Sendable {
             }
             return
         }
-        commandBuffer.label = "GPU Sort"
+        commandBuffer.label = "GPU Bitonic Sort"
 
-        let blockCount = (totalSplatCount + Self.threadgroupSize - 1) / Self.threadgroupSize
-
-        // Prepare uniforms
-        var uniforms = GPUSortUniforms(
-            cameraPosition: MTLPackedFloat3Make(cameraPose.position.x, cameraPose.position.y, cameraPose.position.z),
-            totalSplatCount: UInt32(totalSplatCount),
-            bitOffset: 0,
-            blockCount: UInt32(blockCount),
-            sortByDistance: SplatRenderer.Constants.sortByDistance ? 1 : 0,
-            cameraForward: MTLPackedFloat3Make(cameraPose.forward.x, cameraPose.forward.y, cameraPose.forward.z)
-        )
-
-        guard let depthKeysA = depthKeysA,
-              let depthKeysB = depthKeysB,
-              let histogramBuffer = histogramBuffer,
-              let blockSumsBuffer = blockSumsBuffer,
+        guard let depthKeys = depthKeys,
               let chunkOffsetsBuffer = chunkOffsetsBuffer else {
             Self.log.error("Working buffers not initialized")
             state.withLock { state in
@@ -527,6 +510,17 @@ class SplatSorterGPU: @unchecked Sendable {
             return
         }
 
+        // Prepare uniforms
+        var uniforms = GPUSortUniforms(
+            cameraPosition: MTLPackedFloat3Make(cameraPose.position.x, cameraPose.position.y, cameraPose.position.z),
+            totalSplatCount: UInt32(totalSplatCount),
+            bitonicStage: 0,
+            bitonicStep: 0,
+            sortByDistance: SplatRenderer.Constants.sortByDistance ? 1 : 0,
+            cameraForward: MTLPackedFloat3Make(cameraPose.forward.x, cameraPose.forward.y, cameraPose.forward.z),
+            paddedCount: UInt32(paddedCount)
+        )
+
         // ========================================
         // Pass 1: Compute Depth Keys
         // ========================================
@@ -534,7 +528,7 @@ class SplatSorterGPU: @unchecked Sendable {
             encoder.label = "Compute Depths"
             encoder.setComputePipelineState(computeDepthsPipeline)
             encoder.setBuffer(chunkTableBuffer, offset: 0, index: 0)
-            encoder.setBuffer(depthKeysA.buffer, offset: 0, index: 1)
+            encoder.setBuffer(depthKeys.buffer, offset: 0, index: 1)
             encoder.setBytes(&uniforms, length: MemoryLayout<GPUSortUniforms>.size, index: 2)
 
             // Make chunk splat buffers resident
@@ -549,75 +543,74 @@ class SplatSorterGPU: @unchecked Sendable {
         }
 
         // ========================================
-        // Passes 2-5: 4 Radix Sort Passes (8 bits each)
+        // Pass 1.5: Fill padding with UINT_MAX
         // ========================================
-        var inputBuffer = depthKeysA.buffer
-        var outputBuffer = depthKeysB.buffer
-
-        for pass in 0..<4 {
-            uniforms.bitOffset = UInt32(pass * 8)
-
-            // Clear histogram
+        if paddedCount > totalSplatCount {
             if let encoder = commandBuffer.makeBlitCommandEncoder() {
-                encoder.label = "Clear Histogram Pass \(pass)"
-                encoder.fill(buffer: histogramBuffer, range: 0..<histogramBuffer.length, value: 0)
+                encoder.label = "Fill Padding"
+                let startByte = totalSplatCount * MemoryLayout<SplatDepthKey>.stride
+                let endByte = paddedCount * MemoryLayout<SplatDepthKey>.stride
+                encoder.fill(buffer: depthKeys.buffer, range: startByte..<endByte, value: 0xFF)
                 encoder.endEncoding()
             }
-
-            // Histogram
-            if let encoder = commandBuffer.makeComputeCommandEncoder() {
-                encoder.label = "Histogram Pass \(pass)"
-                encoder.setComputePipelineState(radixHistogramPipeline)
-                encoder.setBuffer(inputBuffer, offset: 0, index: 0)
-                encoder.setBuffer(histogramBuffer, offset: 0, index: 1)
-                encoder.setBytes(&uniforms, length: MemoryLayout<GPUSortUniforms>.size, index: 2)
-
-                let threadsPerGrid = MTLSize(width: totalSplatCount, height: 1, depth: 1)
-                let threadsPerThreadgroup = MTLSize(width: Self.threadgroupSize, height: 1, depth: 1)
-                encoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
-                encoder.endEncoding()
-            }
-
-            // Prefix Sum - single threadgroup of 256 threads
-            if let encoder = commandBuffer.makeComputeCommandEncoder() {
-                encoder.label = "Prefix Sum Pass \(pass)"
-                encoder.setComputePipelineState(prefixSumLocalPipeline)
-                encoder.setBuffer(histogramBuffer, offset: 0, index: 0)
-                encoder.setBuffer(blockSumsBuffer, offset: 0, index: 1)
-                encoder.setBytes(&uniforms, length: MemoryLayout<GPUSortUniforms>.size, index: 2)
-
-                // Single threadgroup with 256 threads for 256-element prefix sum
-                let threadsPerThreadgroup = MTLSize(width: Int(Self.radixSize), height: 1, depth: 1)
-                encoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                             threadsPerThreadgroup: threadsPerThreadgroup)
-                encoder.endEncoding()
-            }
-
-            // Note: addBlockSums pass removed - not needed in simplified approach
-
-            // Scatter
-            if let encoder = commandBuffer.makeComputeCommandEncoder() {
-                encoder.label = "Scatter Pass \(pass)"
-                encoder.setComputePipelineState(radixScatterPipeline)
-                encoder.setBuffer(inputBuffer, offset: 0, index: 0)
-                encoder.setBuffer(outputBuffer, offset: 0, index: 1)
-                encoder.setBuffer(histogramBuffer, offset: 0, index: 2)
-                encoder.setBytes(&uniforms, length: MemoryLayout<GPUSortUniforms>.size, index: 3)
-
-                let threadsPerGrid = MTLSize(width: totalSplatCount, height: 1, depth: 1)
-                let threadsPerThreadgroup = MTLSize(width: Self.threadgroupSize, height: 1, depth: 1)
-                encoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
-                encoder.endEncoding()
-            }
-
-            // Swap buffers for next pass
-            swap(&inputBuffer, &outputBuffer)
         }
 
-        // After 4 passes, sorted data is in inputBuffer (due to final swap)
+        // ========================================
+        // Pass 2: Bitonic Sort Local (stages 0-8)
+        // ========================================
+        let numBlocks = paddedCount / Self.blockSize
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Bitonic Sort Local"
+            encoder.setComputePipelineState(bitonicSortLocalPipeline)
+            encoder.setBuffer(depthKeys.buffer, offset: 0, index: 0)
+            encoder.setBytes(&uniforms, length: MemoryLayout<GPUSortUniforms>.size, index: 1)
+
+            let threadgroupCount = MTLSize(width: numBlocks, height: 1, depth: 1)
+            let threadsPerThreadgroup = MTLSize(width: Self.threadgroupSize, height: 1, depth: 1)
+            encoder.dispatchThreadgroups(threadgroupCount, threadsPerThreadgroup: threadsPerThreadgroup)
+            encoder.endEncoding()
+        }
 
         // ========================================
-        // Pass 6: Convert to Chunked Indices
+        // Pass 3: Bitonic Merge (stages 9..log2N-1)
+        // ========================================
+        for stage in Self.log2Block..<log2N {
+            // Global merge steps: from step=stage down to step=log2Block (stride >= 512)
+            for step in stride(from: stage, through: Self.log2Block, by: -1) {
+                uniforms.bitonicStage = UInt32(stage)
+                uniforms.bitonicStep = UInt32(step)
+
+                if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                    encoder.label = "Bitonic Merge Global s\(stage) p\(step)"
+                    encoder.setComputePipelineState(bitonicMergeGlobalPipeline)
+                    encoder.setBuffer(depthKeys.buffer, offset: 0, index: 0)
+                    encoder.setBytes(&uniforms, length: MemoryLayout<GPUSortUniforms>.size, index: 1)
+
+                    let threadsPerGrid = MTLSize(width: paddedCount / 2, height: 1, depth: 1)
+                    let threadsPerThreadgroup = MTLSize(width: Self.threadgroupSize, height: 1, depth: 1)
+                    encoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+                    encoder.endEncoding()
+                }
+            }
+
+            // Local merge: finish remaining steps (stride < 512) in shared memory
+            uniforms.bitonicStage = UInt32(stage)
+
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "Bitonic Merge Local s\(stage)"
+                encoder.setComputePipelineState(bitonicMergeLocalPipeline)
+                encoder.setBuffer(depthKeys.buffer, offset: 0, index: 0)
+                encoder.setBytes(&uniforms, length: MemoryLayout<GPUSortUniforms>.size, index: 1)
+
+                let threadgroupCount = MTLSize(width: numBlocks, height: 1, depth: 1)
+                let threadsPerThreadgroup = MTLSize(width: Self.threadgroupSize, height: 1, depth: 1)
+                encoder.dispatchThreadgroups(threadgroupCount, threadsPerThreadgroup: threadsPerThreadgroup)
+                encoder.endEncoding()
+            }
+        }
+
+        // ========================================
+        // Pass 4: Convert to Chunked Indices
         // ========================================
         var splatCount = UInt32(totalSplatCount)
         var chunkCount = UInt32(chunks.count)
@@ -625,7 +618,7 @@ class SplatSorterGPU: @unchecked Sendable {
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             encoder.label = "Convert to Chunked Indices"
             encoder.setComputePipelineState(convertToChunkedIndicesPipeline)
-            encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+            encoder.setBuffer(depthKeys.buffer, offset: 0, index: 0)
             encoder.setBuffer(chunkOffsetsBuffer.buffer, offset: 0, index: 1)
             encoder.setBuffer(targetBuffer.buffer, offset: 0, index: 2)
             encoder.setBytes(&splatCount, length: MemoryLayout<UInt32>.size, index: 3)
@@ -656,42 +649,35 @@ class SplatSorterGPU: @unchecked Sendable {
 
         if !wasInvalidated {
             let duration = -startTime.timeIntervalSinceNow
-            Self.log.info("GPU sort completed: \(totalSplatCount) splats in \(String(format: "%.1f", duration * 1000))ms")
+            Self.log.info("GPU bitonic sort completed: \(totalSplatCount) splats (padded to \(paddedCount)) in \(String(format: "%.1f", duration * 1000))ms")
             onSortComplete?(duration)
         }
     }
 
     // MARK: - Buffer Management
 
-    private func ensureBufferCapacity(splatCount: Int) throws {
-        let blockCount = (splatCount + Self.threadgroupSize - 1) / Self.threadgroupSize
+    private func ensureBufferCapacity(paddedCount: Int) throws {
+        guard paddedCount != lastPaddedCount else { return }
 
-        // Depth key buffers (double-buffered)
-        if depthKeysA == nil || depthKeysA!.capacity < splatCount {
-            depthKeysA = try MetalBuffer<SplatDepthKey>(device: device, capacity: splatCount)
-            depthKeysA!.buffer.label = "Depth Keys A"
-        }
-        if depthKeysB == nil || depthKeysB!.capacity < splatCount {
-            depthKeysB = try MetalBuffer<SplatDepthKey>(device: device, capacity: splatCount)
-            depthKeysB!.buffer.label = "Depth Keys B"
+        // Single depth key buffer (bitonic sort is in-place)
+        if depthKeys == nil || depthKeys!.capacity < paddedCount {
+            depthKeys = try MetalBuffer<SplatDepthKey>(device: device, capacity: paddedCount)
+            depthKeys!.buffer.label = "Depth Keys"
+            Self.log.info("Allocated depth keys buffer: \(paddedCount) elements (\(String(format: "%.1f", Double(paddedCount * MemoryLayout<SplatDepthKey>.stride) / 1_048_576))MB)")
         }
 
-        // Histogram buffer: just 256 elements (simplified approach)
-        let histogramSize = Int(Self.radixSize) * MemoryLayout<UInt32>.stride
-        if histogramBuffer == nil || histogramBuffer!.length < histogramSize {
-            histogramBuffer = device.makeBuffer(length: histogramSize, options: .storageModeShared)
-            histogramBuffer?.label = "Histogram"
-        }
+        lastPaddedCount = paddedCount
+    }
 
-        // Block sums buffer: 256 digits (kept for API compatibility, not used)
-        let blockSumsSize = Int(Self.radixSize) * MemoryLayout<UInt32>.stride
-        if blockSumsBuffer == nil || blockSumsBuffer!.length < blockSumsSize {
-            blockSumsBuffer = device.makeBuffer(length: blockSumsSize, options: .storageModeShared)
-            blockSumsBuffer?.label = "Block Sums"
-        }
-
-        lastSplatCount = splatCount
-        lastBlockCount = blockCount
+    private func nextPowerOfTwo(_ n: Int) -> Int {
+        guard n > 1 else { return 1 }
+        var v = n - 1
+        v |= v >> 1
+        v |= v >> 2
+        v |= v >> 4
+        v |= v >> 8
+        v |= v >> 16
+        return v + 1
     }
 
     private func buildChunkTableBuffer(chunks: [ChunkReference]) -> MTLBuffer? {

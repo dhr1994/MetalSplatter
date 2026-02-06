@@ -115,7 +115,7 @@ typedef struct
 } FragmentIn;
 
 // ============================================================================
-// GPU Radix Sort Structures
+// GPU Bitonic Sort Structures
 // ============================================================================
 
 // Depth key paired with original splat index for sorting
@@ -130,11 +130,11 @@ typedef struct
 {
     packed_float3 cameraPosition;
     uint totalSplatCount;
-    uint bitOffset;     // Current bit position: 0, 8, 16, or 24 for 4 radix passes
-    uint blockCount;    // Number of threadgroups for histogram/scatter
+    uint bitonicStage;  // Current bitonic stage (0..log2(N)-1)
+    uint bitonicStep;   // Current step within stage
     uint sortByDistance; // 1 = distance from camera, 0 = dot product with forward
     packed_float3 cameraForward;
-    uint _padding;
+    uint paddedCount;   // Next power of 2 >= totalSplatCount
 } GPUSortUniforms;
 
 // Maps global splat index to chunk/local index for final output

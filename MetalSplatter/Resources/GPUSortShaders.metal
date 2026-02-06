@@ -5,21 +5,24 @@
 using namespace metal;
 
 // ============================================================================
-// GPU Radix Sort Implementation (Simplified)
+// GPU Bitonic Sort Implementation
 // ============================================================================
 //
-// This implements a 4-pass radix sort for 32-bit depth keys, processing 8 bits
-// per pass. Uses a simplified approach with global atomics for correctness.
+// Bitonic sort uses compare-and-swap operations to sort data in parallel.
+// It is deterministic (no atomics) and naturally suited to GPU execution.
 //
-// Each pass:
-//   1. Compute global histogram (256 buckets)
-//   2. Prefix sum on histogram
-//   3. Scatter using atomic counters
+// Pipeline:
+//   1. computeDepths — compute depth keys from splat positions
+//   2. bitonicSortLocal — sort 512-element blocks in shared memory (stages 0-8)
+//   3. For stages 9..log2(N)-1:
+//      a. bitonicMergeGlobal — compare-and-swap for large strides (≥512)
+//      b. bitonicMergeLocal — finish stage in shared memory (strides <512)
+//   4. convertToChunkedIndices — convert sorted indices back to chunk format
 // ============================================================================
 
-constant uint RADIX_BITS = 8;
-constant uint RADIX_SIZE = 256;  // 2^8 = 256 buckets
-constant uint THREADGROUP_SIZE = 256;
+constant uint BLOCK_SIZE = 512;       // Elements per shared-memory block
+constant uint HALF_BLOCK = 256;       // Threads per threadgroup
+constant uint LOG2_BLOCK = 9;         // log2(512) = 9
 
 // ============================================================================
 // Float-to-Sortable-Uint Conversion
@@ -49,7 +52,6 @@ kernel void computeDepths(
     device ChunkInfo* chunks = chunkTable->chunks;
     uint chunkCount = chunkTable->enabledChunkCount;
 
-    uint runningCount = 0;
     uint localIndex = globalIndex;
 
     for (uint c = 0; c < chunkCount; c++) {
@@ -78,110 +80,183 @@ kernel void computeDepths(
 }
 
 // ============================================================================
-// Kernel 2: Radix Histogram (Global)
+// Kernel 2: Bitonic Sort Local (stages 0-8, shared memory)
 // ============================================================================
 //
-// Counts occurrences of each 8-bit digit. Output: 256 global counts.
+// Each threadgroup sorts a block of 512 elements entirely in shared memory.
+// 256 threads per group, each handles 2 elements.
 
-kernel void radixHistogram(
-    device const SplatDepthKey* inputKeys [[buffer(0)]],
-    device atomic_uint* histogram [[buffer(1)]],
-    constant GPUSortUniforms& uniforms [[buffer(2)]],
-    uint globalIndex [[thread_position_in_grid]])
+kernel void bitonicSortLocal(
+    device SplatDepthKey* depthKeys [[buffer(0)]],
+    constant GPUSortUniforms& uniforms [[buffer(1)]],
+    uint localId [[thread_position_in_threadgroup]],
+    uint groupId [[threadgroup_position_in_grid]])
 {
-    if (globalIndex >= uniforms.totalSplatCount) {
-        return;
-    }
+    threadgroup SplatDepthKey shared_data[BLOCK_SIZE];
 
-    uint key = inputKeys[globalIndex].sortKey;
-    uint digit = (key >> uniforms.bitOffset) & (RADIX_SIZE - 1);
-    atomic_fetch_add_explicit(&histogram[digit], 1, memory_order_relaxed);
-}
+    uint blockStart = groupId * BLOCK_SIZE;
+    uint idx0 = blockStart + localId;
+    uint idx1 = blockStart + localId + HALF_BLOCK;
 
-// ============================================================================
-// Kernel 3: Prefix Sum (256 elements only)
-// ============================================================================
-//
-// Performs exclusive prefix sum on the 256-element histogram.
-// Single threadgroup, simple parallel scan.
-
-kernel void prefixSumLocal(
-    device uint* histogram [[buffer(0)]],
-    device uint* blockSums [[buffer(1)]],  // unused in this version
-    constant GPUSortUniforms& uniforms [[buffer(2)]],
-    uint localIndex [[thread_position_in_threadgroup]])
-{
-    threadgroup uint shared[RADIX_SIZE];
-
-    // Load histogram into shared memory
-    shared[localIndex] = histogram[localIndex];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Hillis-Steele parallel scan (inclusive)
-    for (uint stride = 1; stride < RADIX_SIZE; stride *= 2) {
-        uint val = 0;
-        if (localIndex >= stride) {
-            val = shared[localIndex - stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        shared[localIndex] += val;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Convert to exclusive scan (shift right, insert 0)
-    uint myVal = shared[localIndex];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (localIndex == 0) {
-        histogram[0] = 0;
+    // Load into shared memory, padding out-of-bounds with UINT_MAX
+    if (idx0 < uniforms.paddedCount) {
+        shared_data[localId] = depthKeys[idx0];
     } else {
-        histogram[localIndex] = shared[localIndex - 1];
+        shared_data[localId] = SplatDepthKey{ UINT_MAX, UINT_MAX };
+    }
+    if (idx1 < uniforms.paddedCount) {
+        shared_data[localId + HALF_BLOCK] = depthKeys[idx1];
+    } else {
+        shared_data[localId + HALF_BLOCK] = SplatDepthKey{ UINT_MAX, UINT_MAX };
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Run stages 0 through LOG2_BLOCK-1 (stages 0-8)
+    for (uint stage = 0; stage < LOG2_BLOCK; stage++) {
+        for (uint step = stage; step != UINT_MAX; step--) {
+            uint stride = 1u << step;
+            // Determine which pair this thread operates on
+            uint pairIdx = localId + (localId / stride) * stride;
+            uint partner = pairIdx + stride;
+
+            if (partner < BLOCK_SIZE) {
+                // Direction: ascending if the (stage+1)-th bit of the block-relative index is 0
+                bool ascending = ((pairIdx >> (stage + 1)) & 1) == 0;
+
+                SplatDepthKey a = shared_data[pairIdx];
+                SplatDepthKey b = shared_data[partner];
+
+                bool shouldSwap = ascending
+                    ? (a.sortKey > b.sortKey)
+                    : (a.sortKey < b.sortKey);
+
+                if (shouldSwap) {
+                    shared_data[pairIdx] = b;
+                    shared_data[partner] = a;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Write back to global memory
+    if (idx0 < uniforms.paddedCount) {
+        depthKeys[idx0] = shared_data[localId];
+    }
+    if (idx1 < uniforms.paddedCount) {
+        depthKeys[idx1] = shared_data[localId + HALF_BLOCK];
     }
 }
 
 // ============================================================================
-// Kernel 4: Add Block Sums (not needed in simplified version)
-// ============================================================================
-
-kernel void addBlockSums(
-    device uint* histogram [[buffer(0)]],
-    device uint* blockSums [[buffer(1)]],
-    constant GPUSortUniforms& uniforms [[buffer(2)]],
-    uint globalIndex [[thread_position_in_grid]],
-    uint localIndex [[thread_position_in_threadgroup]],
-    uint groupIndex [[threadgroup_position_in_grid]])
-{
-    // Not used in simplified version - kept for API compatibility
-}
-
-// ============================================================================
-// Kernel 5: Radix Scatter (with global atomics)
+// Kernel 3: Bitonic Merge Global (large strides ≥ 512)
 // ============================================================================
 //
-// Reorders elements based on digit values using atomic counters.
+// One compare-and-swap per thread for a single (stage, step) pair.
 
-kernel void radixScatter(
-    device const SplatDepthKey* inputKeys [[buffer(0)]],
-    device SplatDepthKey* outputKeys [[buffer(1)]],
-    device atomic_uint* histogram [[buffer(2)]],
-    constant GPUSortUniforms& uniforms [[buffer(3)]],
-    uint globalIndex [[thread_position_in_grid]])
+kernel void bitonicMergeGlobal(
+    device SplatDepthKey* depthKeys [[buffer(0)]],
+    constant GPUSortUniforms& uniforms [[buffer(1)]],
+    uint globalId [[thread_position_in_grid]])
 {
-    if (globalIndex >= uniforms.totalSplatCount) {
-        return;
+    uint stride = 1u << uniforms.bitonicStep;
+    uint halfStride = stride;
+
+    // Map thread to element pair
+    uint pairIdx = globalId + (globalId / halfStride) * halfStride;
+    uint partner = pairIdx + halfStride;
+
+    if (partner >= uniforms.paddedCount) return;
+
+    // Direction determined by the stage
+    bool ascending = ((pairIdx >> (uniforms.bitonicStage + 1)) & 1) == 0;
+
+    SplatDepthKey a = depthKeys[pairIdx];
+    SplatDepthKey b = depthKeys[partner];
+
+    bool shouldSwap = ascending
+        ? (a.sortKey > b.sortKey)
+        : (a.sortKey < b.sortKey);
+
+    if (shouldSwap) {
+        depthKeys[pairIdx] = b;
+        depthKeys[partner] = a;
     }
-
-    SplatDepthKey elem = inputKeys[globalIndex];
-    uint digit = (elem.sortKey >> uniforms.bitOffset) & (RADIX_SIZE - 1);
-
-    // Get unique output position using atomic increment
-    uint outputPos = atomic_fetch_add_explicit(&histogram[digit], 1, memory_order_relaxed);
-
-    outputKeys[outputPos] = elem;
 }
 
 // ============================================================================
-// Kernel 6: Convert to Chunked Indices
+// Kernel 4: Bitonic Merge Local (tail steps with stride < 512, shared memory)
+// ============================================================================
+//
+// After bitonicMergeGlobal handles the large-stride step(s) of a stage,
+// this kernel finishes the remaining steps (stride 256 down to 1) in shared memory.
+
+kernel void bitonicMergeLocal(
+    device SplatDepthKey* depthKeys [[buffer(0)]],
+    constant GPUSortUniforms& uniforms [[buffer(1)]],
+    uint localId [[thread_position_in_threadgroup]],
+    uint groupId [[threadgroup_position_in_grid]])
+{
+    threadgroup SplatDepthKey shared_data[BLOCK_SIZE];
+
+    uint blockStart = groupId * BLOCK_SIZE;
+    uint idx0 = blockStart + localId;
+    uint idx1 = blockStart + localId + HALF_BLOCK;
+
+    // Load into shared memory
+    if (idx0 < uniforms.paddedCount) {
+        shared_data[localId] = depthKeys[idx0];
+    } else {
+        shared_data[localId] = SplatDepthKey{ UINT_MAX, UINT_MAX };
+    }
+    if (idx1 < uniforms.paddedCount) {
+        shared_data[localId + HALF_BLOCK] = depthKeys[idx1];
+    } else {
+        shared_data[localId + HALF_BLOCK] = SplatDepthKey{ UINT_MAX, UINT_MAX };
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Run steps from LOG2_BLOCK-1 (8) down to 0 within shared memory
+    for (uint step = LOG2_BLOCK - 1; step != UINT_MAX; step--) {
+        uint stride = 1u << step;
+        uint pairIdx = localId + (localId / stride) * stride;
+        uint partner = pairIdx + stride;
+
+        if (partner < BLOCK_SIZE) {
+            // Direction: use the global index for determining sort direction
+            uint globalPairIdx = blockStart + pairIdx;
+            bool ascending = ((globalPairIdx >> (uniforms.bitonicStage + 1)) & 1) == 0;
+
+            SplatDepthKey a = shared_data[pairIdx];
+            SplatDepthKey b = shared_data[partner];
+
+            bool shouldSwap = ascending
+                ? (a.sortKey > b.sortKey)
+                : (a.sortKey < b.sortKey);
+
+            if (shouldSwap) {
+                shared_data[pairIdx] = b;
+                shared_data[partner] = a;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write back
+    if (idx0 < uniforms.paddedCount) {
+        depthKeys[idx0] = shared_data[localId];
+    }
+    if (idx1 < uniforms.paddedCount) {
+        depthKeys[idx1] = shared_data[localId + HALF_BLOCK];
+    }
+}
+
+// ============================================================================
+// Kernel 5: Convert to Chunked Indices
 // ============================================================================
 
 kernel void convertToChunkedIndices(
